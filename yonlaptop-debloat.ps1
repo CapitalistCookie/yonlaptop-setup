@@ -428,7 +428,7 @@ if ($Verify) {
 # ============================================================================
 # 1.  AppX bloat removal
 # ============================================================================
-Write-Section '1  AppX bloat removal (parallel)'
+Write-Section '1  AppX bloat removal'
 
 # Build work list (filter keep-list upfront)
 $appxWork = foreach ($pkg in $script:BloatAppX) {
@@ -437,53 +437,26 @@ $appxWork = foreach ($pkg in $script:BloatAppX) {
     $pkg
 }
 
-if ($DryRun -or $Verify) {
-    foreach ($pkg in $appxWork) { Write-Step "[skip] remove AppX: $pkg" 'SKIP' }
-} elseif ($appxWork.Count -gt 0) {
-    # Make sure ThreadJob module is loaded (ships with PS 5.1 on Win10/11)
-    if (-not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
-        Import-Module ThreadJob -ErrorAction SilentlyContinue
-    }
+# NOTE: Earlier versions used ThreadJob for parallel removal. Reverted to serial
+# because PS 7.6.2's ThreadJob deadlocked on concurrent Remove-AppxPackage calls
+# in real-world testing (Wait-Job never returned). With Defender RT disabled
+# (Phase 5) each serial removal is fast - the whole list usually takes 2-5 min.
+foreach ($pkg in $appxWork) {
+    if ($DryRun -or $Verify) { Write-Step "[skip] remove AppX: $pkg" 'SKIP'; continue }
+    Invoke-Safe {
+        Get-AppxPackage -Name $pkg -AllUsers -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
+        Get-AppxPackage -Name $pkg -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue }
+    } "remove AppX: $pkg"
 
-    $appxScript = {
-        param($name)
-        try {
-            Get-AppxPackage -Name $name -AllUsers -ErrorAction SilentlyContinue |
-                ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
-            Get-AppxPackage -Name $name -ErrorAction SilentlyContinue |
-                ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue }
-            try {
-                Get-AppxProvisionedPackage -Online -ErrorAction Stop |
-                    Where-Object DisplayName -eq $name |
-                    ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue }
-                [pscustomobject]@{ Name = $name; Status = 'OK';   Error = $null }
-            } catch {
-                # Provisioned-package removal hit DISM "Class not registered" — common, harmless
-                [pscustomobject]@{ Name = $name; Status = 'OK';   Error = "prov-skip: $($_.Exception.Message)" }
-            }
-        } catch {
-            [pscustomobject]@{ Name = $name; Status = 'FAIL'; Error = $_.Exception.Message }
-        }
-    }
-
-    if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) {
-        Write-Step "dispatching $($appxWork.Count) parallel AppX removals (throttle=6)" 'INFO'
-        $jobs = $appxWork | ForEach-Object {
-            Start-ThreadJob -Name "appx-$_" -ScriptBlock $appxScript -ArgumentList $_ -ThrottleLimit 6
-        }
-        $jobs | Wait-Job | ForEach-Object {
-            $r = Receive-Job $_
-            if ($r.Status -eq 'OK') { Write-Step "remove AppX: $($r.Name)" 'OK' }
-            else { Write-Step "remove AppX: $($r.Name)  --  $($r.Error)" 'FAIL'; $script:Failures += "AppX:$($r.Name)" }
-            Remove-Job $_
-        }
-    } else {
-        # Last-ditch serial fallback (no ThreadJob)
-        Write-Step 'ThreadJob unavailable — falling back to serial removal' 'WARN'
-        foreach ($pkg in $appxWork) {
-            Invoke-Safe { & $appxScript $pkg | Out-Null } "remove AppX: $pkg"
-        }
-    }
+    # Provisioned package removal sometimes throws "Class not registered" on the
+    # DISM-backed pipeline. Best-effort, swallowed if it errors.
+    try {
+        Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+            Where-Object DisplayName -eq $pkg |
+            ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue } | Out-Null
+    } catch { }
 }
 
 # Block consumer feature reinstall + suggested content
