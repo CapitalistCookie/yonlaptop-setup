@@ -351,26 +351,62 @@ if ($Verify) {
 # ============================================================================
 # 1.  AppX bloat removal
 # ============================================================================
-Write-Section '1  AppX bloat removal'
+Write-Section '1  AppX bloat removal (parallel)'
 
-foreach ($pkg in $script:BloatAppX) {
-    if ($script:KeepAppX -contains $pkg)   { Write-Step "keep (whitelist): $pkg" 'SKIP'; continue }
-    if ($KeepBuiltinApps  -contains $pkg)  { Write-Step "keep (param):     $pkg" 'SKIP'; continue }
+# Build work list (filter keep-list upfront)
+$appxWork = foreach ($pkg in $script:BloatAppX) {
+    if ($script:KeepAppX -contains $pkg) { Write-Step "keep (whitelist): $pkg" 'SKIP'; continue }
+    if ($KeepBuiltinApps -contains $pkg) { Write-Step "keep (param):     $pkg" 'SKIP'; continue }
+    $pkg
+}
 
-    # Per-user packages (current + all installed users)
-    Invoke-Safe {
-        Get-AppxPackage -Name $pkg -AllUsers -ErrorAction SilentlyContinue |
-            ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
-        Get-AppxPackage -Name $pkg -ErrorAction SilentlyContinue |
-            ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue }
-    } "remove AppX: $pkg"
+if ($DryRun -or $Verify) {
+    foreach ($pkg in $appxWork) { Write-Step "[skip] remove AppX: $pkg" 'SKIP' }
+} elseif ($appxWork.Count -gt 0) {
+    # Make sure ThreadJob module is loaded (ships with PS 5.1 on Win10/11)
+    if (-not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
+        Import-Module ThreadJob -ErrorAction SilentlyContinue
+    }
 
-    # Provisioned (so new users don't get it)
-    Invoke-Safe {
-        Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-            Where-Object DisplayName -eq $pkg |
-            ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue }
-    } "remove provisioned: $pkg"
+    $appxScript = {
+        param($name)
+        try {
+            Get-AppxPackage -Name $name -AllUsers -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
+            Get-AppxPackage -Name $name -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue }
+            try {
+                Get-AppxProvisionedPackage -Online -ErrorAction Stop |
+                    Where-Object DisplayName -eq $name |
+                    ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue }
+                [pscustomobject]@{ Name = $name; Status = 'OK';   Error = $null }
+            } catch {
+                # Provisioned-package removal hit DISM "Class not registered" — common, harmless
+                [pscustomobject]@{ Name = $name; Status = 'OK';   Error = "prov-skip: $($_.Exception.Message)" }
+            }
+        } catch {
+            [pscustomobject]@{ Name = $name; Status = 'FAIL'; Error = $_.Exception.Message }
+        }
+    }
+
+    if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) {
+        Write-Step "dispatching $($appxWork.Count) parallel AppX removals (throttle=6)" 'INFO'
+        $jobs = $appxWork | ForEach-Object {
+            Start-ThreadJob -Name "appx-$_" -ScriptBlock $appxScript -ArgumentList $_ -ThrottleLimit 6
+        }
+        $jobs | Wait-Job | ForEach-Object {
+            $r = Receive-Job $_
+            if ($r.Status -eq 'OK') { Write-Step "remove AppX: $($r.Name)" 'OK' }
+            else { Write-Step "remove AppX: $($r.Name)  --  $($r.Error)" 'FAIL'; $script:Failures += "AppX:$($r.Name)" }
+            Remove-Job $_
+        }
+    } else {
+        # Last-ditch serial fallback (no ThreadJob)
+        Write-Step 'ThreadJob unavailable — falling back to serial removal' 'WARN'
+        foreach ($pkg in $appxWork) {
+            Invoke-Safe { & $appxScript $pkg | Out-Null } "remove AppX: $pkg"
+        }
+    }
 }
 
 # Block consumer feature reinstall + suggested content
