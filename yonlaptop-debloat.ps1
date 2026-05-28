@@ -33,7 +33,14 @@
        16   Telemetry endpoints HOSTS block
        17   Explorer cleanup (Home tab off, Gallery off, full path, etc.)
        18   Start menu / lock screen / suggestions cleanup
-       19   DISM cleanup + ResetBase (slow — runs last)
+       19   Vendor program uninstall (Lenovo Vantage / Intel XTU / NVIDIA App /
+            iTunes / Logi Download Assistant / Logi Unifying — audit-based)
+       20   Extra scheduled task disable (Lenovo iM, Office updaters, Google
+            updater, Work Folders, RecommendedTroubleshootingScanner)
+       21   Extra service trim (LenovoVantage/Smart/ImController, XtuService,
+            ipfsvc, OptionsPlusUpdater, Apple Mobile Device, Bonjour,
+            NvContainerLocalSystem when NVIDIA App removed; Spooler -> Manual)
+       22   DISM cleanup + ResetBase (slow — runs last)
 
     Idempotent. Re-runnable. Logs land in C:\ProgramData\DevAccessSetup\.
 
@@ -82,6 +89,29 @@
 .PARAMETER SkipServiceTrim
     Skip the bulk service-disable phase.
 
+.PARAMETER KeepVendorPrograms
+    Skip Phase 19 (vendor program uninstall) entirely.
+
+.PARAMETER KeepLenovoVantage
+    Keep Lenovo Vantage / iM Controller / Smart Service. Note: NVIDIA driver,
+    LenovoFnAndFunctionKeys, TPHKLOAD, dptftcs, DAService are NEVER touched -
+    they're load-bearing hardware drivers (Fn keys, thermals, display audio).
+
+.PARAMETER KeepIntelXTU
+    Keep Intel Extreme Tuning Utility.
+
+.PARAMETER KeepNvidiaApp
+    Keep NVIDIA App. The NVIDIA Graphics Driver is always kept.
+
+.PARAMETER KeepITunes
+    Keep iTunes + Bonjour + Apple Mobile Device support.
+
+.PARAMETER KeepLogiDownloadAssistant
+    Keep Logi Download Assistant.
+
+.PARAMETER KeepLogiUnifying
+    Keep Logitech Unifying Software.
+
 .EXAMPLE
     # Full Tier-1 debloat
     .\yonlaptop-debloat.ps1
@@ -119,7 +149,15 @@ param(
     [string[]] $KeepBuiltinApps = @(),
     [int]      $PageFileSizeMB  = 16384,
     [switch]   $SkipDISMCleanup,
-    [switch]   $SkipServiceTrim
+    [switch]   $SkipServiceTrim,
+    # ----- Tier-1 vendor cleanup (audit-based, safe set) -----
+    [switch]   $KeepVendorPrograms,           # skip Phase 19 entirely
+    [switch]   $KeepLenovoVantage,            # keep Lenovo Vantage + iM Controller
+    [switch]   $KeepIntelXTU,                 # keep Intel XTU + IPF helper
+    [switch]   $KeepNvidiaApp,                # keep NVIDIA App (driver always kept)
+    [switch]   $KeepITunes,                   # keep iTunes + Bonjour + Apple Mobile Device
+    [switch]   $KeepLogiDownloadAssistant,
+    [switch]   $KeepLogiUnifying
 )
 
 # ============================================================================
@@ -186,6 +224,45 @@ function Disable-ServiceSafe { param([string]$Name)
         }
         Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
     } "disable service: $Name"
+}
+
+function Find-InstalledApp { param([string]$Pattern)
+    Get-ItemProperty `
+        HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
+        HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*,
+        HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -like $Pattern -and $_.UninstallString }
+}
+
+function Uninstall-AppByPattern { param([string]$Pattern, [string]$Label)
+    $apps = Find-InstalledApp -Pattern $Pattern
+    if (-not $apps) { Write-Step "not installed: $Label" 'SKIP'; return }
+    foreach ($app in $apps) {
+        $name = $app.DisplayName
+        $u    = if ($app.QuietUninstallString) { $app.QuietUninstallString } else { $app.UninstallString }
+        if ($DryRun -or $Verify) { Write-Step "[skip] uninstall: $name" 'SKIP'; continue }
+        try {
+            if ($u -match 'MsiExec\.exe.*\{([0-9A-Fa-f-]+)\}') {
+                # MSI - rewrite to /X with /qn /norestart
+                $guid = $matches[1]
+                Start-Process -FilePath 'msiexec.exe' `
+                    -ArgumentList "/X{$guid} /qn /norestart" -Wait -NoNewWindow `
+                    -ErrorAction Stop
+                Write-Step "uninstalled (MSI): $name" 'OK'
+            } else {
+                # Custom uninstaller - try common silent flags
+                if ($u -match '^"([^"]+)"(.*)$') { $exe = $matches[1]; $argline = $matches[2].Trim() }
+                else { $parts = $u -split ' ', 2; $exe = $parts[0]; $argline = if ($parts.Count -gt 1) { $parts[1] } else { '' } }
+                if ($argline -notmatch '/S\b|--silent|/silent|/quiet|/qn|/q\b') { $argline = "$argline /S".Trim() }
+                Start-Process -FilePath $exe -ArgumentList $argline -Wait -NoNewWindow -ErrorAction Stop
+                Write-Step "uninstalled: $name" 'OK'
+            }
+        } catch {
+            Write-Step "uninstall failed: $name  --  $($_.Exception.Message)" 'FAIL'
+            $script:Failures += "uninstall:$name"
+        }
+    }
 }
 
 # ============================================================================
@@ -930,10 +1007,109 @@ Invoke-Safe {
 } 'Start: Recommended section hidden'
 
 # ============================================================================
-# 19.  DISM cleanup (slow — runs last)
+# 19.  Vendor program uninstall (audit-based, safe set)
+# ============================================================================
+if (-not $KeepVendorPrograms) {
+    Write-Section '19  Vendor program uninstall'
+
+    if (-not $KeepLenovoVantage) {
+        Uninstall-AppByPattern 'Lenovo Vantage*'        'Lenovo Vantage'
+        Uninstall-AppByPattern 'Lenovo iM Controller*'  'Lenovo iM Controller'
+        Uninstall-AppByPattern 'Lenovo Smart*'          'Lenovo Smart Service'
+        # NOTE: deliberately NOT touching LenovoFnAndFunctionKeys / TPHKLOAD / dptftcs / DAService -
+        # those are load-bearing for Fn keys, thermals, and display audio respectively.
+    }
+
+    if (-not $KeepIntelXTU) {
+        Uninstall-AppByPattern 'Install_Intel_IPF_XTU*'       'Intel XTU (Lenovo bundle)'
+        Uninstall-AppByPattern 'Intel(R) Extreme Tuning*'     'Intel XTU'
+    }
+
+    if (-not $KeepNvidiaApp) {
+        # IMPORTANT: KEEP "NVIDIA Graphics Driver" - it's load-bearing for the dGPU.
+        Uninstall-AppByPattern 'NVIDIA App*'              'NVIDIA App'
+        Uninstall-AppByPattern 'NVIDIA MessageBus*'       'NVIDIA MessageBus for NvApp'
+    }
+
+    if (-not $KeepITunes) {
+        Uninstall-AppByPattern 'iTunes*'                   'iTunes'
+        Uninstall-AppByPattern 'Bonjour*'                  'Bonjour'
+        Uninstall-AppByPattern 'Apple Mobile Device*'      'Apple Mobile Device Support'
+        Uninstall-AppByPattern 'Apple Software Update*'    'Apple Software Update'
+        Uninstall-AppByPattern 'Apple Application Support*' 'Apple Application Support'
+    }
+
+    if (-not $KeepLogiDownloadAssistant) {
+        Uninstall-AppByPattern 'Logi Download Assistant*' 'Logi Download Assistant'
+    }
+    if (-not $KeepLogiUnifying) {
+        Uninstall-AppByPattern 'Logitech Unifying Software*' 'Logitech Unifying Software'
+    }
+}
+
+# ============================================================================
+# 20.  Additional scheduled task disable (Lenovo / Office / Google updaters)
+# ============================================================================
+Write-Section '20  Extra scheduled task disable'
+
+$extraTasks = @(
+    '\Lenovo\ImController\Lenovo iM Controller Scheduled Maintenance'
+    '\Lenovo\Vantage\Lenovo.Vantage.ServiceMaintainance'
+    '\Microsoft\Office\Office Automatic Updates 2.0'
+    '\Microsoft\Office\Office Background Push Maintenance'
+    '\Microsoft\Office\Office Feature Updates Logon'
+    '\Microsoft\Office\Office Startup Maintenance'
+    '\Microsoft\Office\Office Actions Server'
+    '\Microsoft\Windows\Diagnosis\RecommendedTroubleshootingScanner'
+    '\Microsoft\Windows\Work Folders\Work Folders Logon Synchronization'
+    '\Microsoft\Windows\Work Folders\Work Folders Maintenance Work'
+)
+foreach ($t in $extraTasks) { Disable-ScheduledTaskSafe $t }
+
+# Google Updater (Chrome). Disable; Chrome itself still updates when opened.
+Get-ScheduledTask -ErrorAction SilentlyContinue |
+    Where-Object { $_.TaskName -like 'GoogleUpdaterTask*' } |
+    ForEach-Object { Disable-ScheduledTaskSafe ("$($_.TaskPath)$($_.TaskName)") }
+
+# ============================================================================
+# 21.  Additional service trim (vendor bloat - audit-verified safe set)
+# ============================================================================
+Write-Section '21  Extra service trim (vendor bloat)'
+
+# Safe-list confirmed against the audit. DO NOT add dptftcs, DAService,
+# LenovoFnAndFunctionKeys, TPHKLOAD, SysMain, or MTKBTSVC here -
+# those are either load-bearing or already in Phase 15 / handled by debloat.
+$vendorServices = @(
+    'LenovoVantageService',
+    'LenovoSmartService',
+    'ImControllerService',
+    'XtuService',
+    'ipfsvc',
+    'OptionsPlusUpdaterService',
+    'Apple Mobile Device Service',
+    'Bonjour Service'
+)
+foreach ($s in $vendorServices) { Disable-ServiceSafe $s }
+
+# Spooler: set to Manual (NOT Disabled) - so it spins up if you ever print
+$spooler = Get-Service Spooler -ErrorAction SilentlyContinue
+if ($spooler) {
+    Invoke-Safe {
+        if ($spooler.Status -eq 'Running') { Stop-Service Spooler -Force -ErrorAction SilentlyContinue }
+        Set-Service Spooler -StartupType Manual
+    } 'Spooler -> Manual (starts on demand)'
+}
+
+# NVIDIA App backend service only if NVIDIA App was uninstalled
+if (-not $KeepNvidiaApp) {
+    Disable-ServiceSafe 'NvContainerLocalSystem'
+}
+
+# ============================================================================
+# 22.  DISM cleanup (slow — runs last)
 # ============================================================================
 if (-not $SkipDISMCleanup) {
-    Write-Section '19  DISM cleanup + ResetBase  (slow, 5-20 min)'
+    Write-Section '22  DISM cleanup + ResetBase  (slow, 5-20 min)'
 
     Invoke-Safe { & DISM.exe /Online /Cleanup-Image /StartComponentCleanup /Quiet 2>&1 | Out-Null } 'StartComponentCleanup'
     Invoke-Safe { & DISM.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase /Quiet 2>&1 | Out-Null } 'StartComponentCleanup /ResetBase'
