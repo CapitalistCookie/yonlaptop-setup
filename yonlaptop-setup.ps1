@@ -419,6 +419,28 @@ Invoke-Safe {
     }
 } 'install OpenSSH.Server capability'
 
+# The FOD post-install action that registers the sshd service is asynchronous
+# and sometimes races us. Wait briefly, then fall back to install-sshd.ps1.
+Invoke-Safe {
+    $tries = 0
+    while (-not (Get-Service sshd -ErrorAction SilentlyContinue) -and $tries -lt 10) {
+        Start-Sleep -Seconds 2; $tries++
+    }
+    if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+        $installSshd = Join-Path $env:WINDIR 'System32\OpenSSH\install-sshd.ps1'
+        if (Test-Path $installSshd) {
+            & $installSshd | Out-Null
+        } elseif (Test-Path "$env:WINDIR\System32\OpenSSH\sshd.exe") {
+            New-Service -Name sshd `
+                -BinaryPathName "$env:WINDIR\System32\OpenSSH\sshd.exe" `
+                -DisplayName 'OpenSSH SSH Server' `
+                -StartupType Automatic | Out-Null
+        } else {
+            throw 'sshd.exe not found - OpenSSH.Server capability install incomplete'
+        }
+    }
+} 'sshd service registration'
+
 Invoke-Safe { Set-Service -Name sshd -StartupType Automatic } 'sshd auto-start'
 Invoke-Safe { Start-Service sshd } 'sshd running'
 
