@@ -853,8 +853,11 @@ if (-not $SkipServiceTrim) {
         'AssignedAccessManagerSvc'
         'AJRouter'                # AllJoyn
         'TrkWks'                  # distributed link tracking
-        'iphlpsvc'                # IPv6 transition; safe to disable unless using Teredo/6to4
-        'SharedAccess'            # ICS
+        # 'iphlpsvc' - DO NOT DISABLE - Tailscale's TUN adapter on Windows
+        #              depends on IP Helper. Disabling it kills Tailscale
+        #              connectivity (tested the hard way 2026-05-28).
+        # 'SharedAccess' - probably safe but skipping out of caution; ICS
+        #              shares some plumbing with VPN adapter management.
         # Biometrics (only disable if no fingerprint reader)
         # 'WbioSrvc'
         # Bluetooth (uncomment if you don't use BT)
