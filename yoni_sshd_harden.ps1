@@ -4,7 +4,7 @@
   (yoni) as Administrator. After this + the CT112-side ControlMaster fix, a harness
   connection-burst can never wedge sshd again, and if anything ever does, a watchdog
   auto-recovers it within ~2 min (vs the old watchdog which only ensured Running and
-  let a "running-but-wedged" sshd slip through — the exact failure that happened).
+  let a "running-but-wedged" sshd slip through -- the exact failure that happened).
 
   WHAT WEDGED IT: wave-3 ran ~35 agents, each opening fresh ssh connections to this box.
   The burst overran the Windows sshd pre-auth queue (default MaxStartups 10:30:100) and
@@ -55,12 +55,10 @@ if (-not $ok) {
 '@ | Set-Content $wd -Encoding ascii
 Write-Host "[harden] wrote wedge-probe watchdog: $wd"
 
-# (3) Register it as a SYSTEM scheduled task every 2 min (replaces/augments the ensure-Running one).
-$act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wd`""
-$trg = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration ([TimeSpan]::MaxValue)
-$prn = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName "sshd-wedge-watchdog" -Action $act -Trigger $trg -Principal $prn -Force | Out-Null
-Write-Host "[harden] scheduled task 'sshd-wedge-watchdog' every 2 min"
+# (3) Register every 2 min via schtasks. (Register-ScheduledTask's RepetitionDuration [TimeSpan]::MaxValue
+#     is rejected as out-of-range -- HRESULT 0x80041318; schtasks /SC MINUTE /MO 2 is the robust path.)
+& schtasks /Create /TN sshd-wedge-watchdog /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $wd" /SC MINUTE /MO 2 /RU SYSTEM /RL HIGHEST /F | Out-Null
+Write-Host "[harden] scheduled task 'sshd-wedge-watchdog' every 2 min (via schtasks)"
 
 # (4) Also configure the Windows service to auto-restart on a hard crash (belt + suspenders).
 & sc.exe failure sshd reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
@@ -71,7 +69,7 @@ if (-not $sshdExe) { $sshdExe = "$env:ProgramFiles\OpenSSH\sshd.exe" }
 $null = & $sshdExe -t 2>&1
 if ($LASTEXITCODE -eq 0) {
   Restart-Service sshd -Force
-  Write-Host "[harden] config VALID; sshd restarted. DONE — wedge can no longer persist."
+  Write-Host "[harden] config VALID; sshd restarted. DONE -- wedge can no longer persist."
 } else {
   Copy-Item "$cfg.bak.preharden" $cfg -Force
   Write-Host "[harden] config INVALID -> REVERTED, sshd NOT restarted (watchdog still active)."
